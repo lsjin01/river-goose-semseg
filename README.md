@@ -58,6 +58,56 @@ data/goose_cat2/
 python tools/convert_to_goose.py --dataset-root data/raw --out data/goose_cat2
 ```
 
+### Train/validation/test 샘플 만들기
+
+원본 데이터에서 각 split의 이미지와 라벨을 한 쌍씩 복사해 빠른 실행 확인용
+데이터셋을 만들 수 있습니다. 원본 파일은 변경하지 않습니다.
+
+```bash
+python tools/create_sample_dataset.py \
+  --source goose_data_cat2 \
+  --output data/sample_goose \
+  --count 1 \
+  --seed 42
+```
+
+생성되는 구조:
+
+```text
+data/sample_goose/
+├── images/{train,val,test}/<scene>/<image>.png
+├── labels/{train,val,test}/<scene>/<image>_labelids.png
+└── manifest.json
+```
+
+교사 모델 1 epoch 학습 확인:
+
+```bash
+python train.py \
+  --data_path data/sample_goose \
+  --output_dir outputs/sample \
+  --run_name smoke_teacher \
+  --epochs 1 --batch_size 1 --num_workers 0 \
+  --resize_width 512 --resize_height 512 \
+  --num_classes 12
+```
+
+검증 또는 테스트 split 평가는 체크포인트를 지정해 실행합니다.
+
+```bash
+python eval_tta_segmentation.py \
+  --model_type student \
+  --checkpoint outputs/student_kd/best.pt \
+  --data_path data/sample_goose \
+  --split val --num_classes 12 --batch_size 1 --num_workers 0
+
+python eval_tta_segmentation.py \
+  --model_type student \
+  --checkpoint outputs/student_kd/best.pt \
+  --data_path data/sample_goose \
+  --split test --num_classes 12 --batch_size 1 --num_workers 0
+```
+
 ## 실행
 
 교사 모델 학습:
