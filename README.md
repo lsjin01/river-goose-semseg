@@ -42,15 +42,56 @@ python setup.py build install
 cd ../../../..
 ```
 
-## 데이터 준비
+## 학습 데이터 준비
 
-GOOSE 형식은 다음 구조를 사용합니다.
+이 프로젝트가 학습하는 대상은 **하천 오염 데이터**입니다. 코드와 일부 경로에 남아
+있는 `goose` 명칭은 기존 데이터 로더와 호환되는 디렉터리 형식을 뜻하며, 실제
+GOOSE 데이터셋을 사용해야 한다는 의미가 아닙니다.
+
+### 필수 폴더 구조
+
+사용할 하천 오염 데이터는 반드시 `train`, `val`, `test`로 분리하고, 각 이미지와
+정답 마스크를 동일한 split 및 scene 폴더에 배치합니다.
 
 ```text
 data/goose_cat2/
-├── images/{train,val,test}/<scene>/*_windshield_vis.png
-└── labels/{train,val,test}/<scene>/*_labelids.png
+├── images/
+│   ├── train/<scene>/<sample>.png
+│   ├── val/<scene>/<sample>.png
+│   └── test/<scene>/<sample>.png
+└── labels/
+    ├── train/<scene>/<sample>_labelids.png
+    ├── val/<scene>/<sample>_labelids.png
+    └── test/<scene>/<sample>_labelids.png
 ```
+
+예를 들어 다음 두 파일이 한 쌍입니다.
+
+```text
+images/train/03.금강/L03_45140_130_20230802_N06_002333.png
+labels/train/03.금강/L03_45140_130_20230802_N06_002333_labelids.png
+```
+
+파일 구성 규칙:
+
+- 이미지와 라벨은 모두 PNG 형식을 사용합니다.
+- 라벨 파일명은 이미지 stem 뒤에 `_labelids`를 붙여 만듭니다.
+- `_windshield_vis`, `_front`, `_camera_left`, `_camera_right`, `_realsense`가 이미지
+  stem 끝에 있으면 라벨을 찾을 때 해당 센서 접미사를 제거합니다.
+- 라벨은 팔레트/RGB 이미지가 아닌 단일 채널 class-ID 마스크여야 합니다.
+- `255`는 학습과 평가에서 제외하는 ignore 값입니다.
+- 동일 촬영 장면이 서로 다른 split에 중복되지 않도록 분리해야 합니다.
+
+현재 12개 class ID는 다음과 같습니다.
+
+| ID | 클래스 | ID | 클래스 |
+|---:|---|---:|---|
+| 0 | background | 6 | 축사 |
+| 1 | 밭_논 | 7 | 야적퇴비_가축분뇨 |
+| 2 | 잔재물 | 8 | 목장 |
+| 3 | 배수로 | 9 | 분뇨개별처리시설 |
+| 4 | 비닐하우스 | 10 | 부유쓰레기 |
+| 5 | 과수원 | 11 | 연못 |
 
 원천 zip 데이터 변환 예시:
 
@@ -58,7 +99,7 @@ data/goose_cat2/
 python tools/convert_to_goose.py --dataset-root data/raw --out data/goose_cat2
 ```
 
-### Train/validation/test 샘플 만들기
+### Train/validation/test 로컬 샘플 만들기
 
 원본 데이터에서 각 split의 이미지와 라벨을 한 쌍씩 복사해 빠른 실행 확인용
 데이터셋을 만들 수 있습니다. 원본 파일은 변경하지 않습니다.
@@ -79,6 +120,11 @@ data/sample_goose/
 ├── labels/{train,val,test}/<scene>/<image>_labelids.png
 └── manifest.json
 ```
+
+`manifest.json`에는 선택된 원본 경로, seed, split별 이미지·라벨 경로가 기록됩니다.
+`data/`는 `.gitignore`에 포함되어 있으므로 생성된 샘플과 실제 학습 데이터는
+GitHub에 올라가지 않습니다. 다른 사용자는 자신의 하천 오염 데이터에서 아래
+명령을 실행해 같은 구조의 샘플을 만들면 됩니다.
 
 교사 모델 1 epoch 학습 확인:
 
