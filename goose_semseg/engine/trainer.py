@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+from goose_semseg.data.coarse_labels import build_batch_cls_aux_targets
+from goose_semseg.losses.m2f_criterion import Mask2FormerSetCriterion
+from goose_semseg.models.head_utils import mask2former_semantic_scores
+from goose_semseg.utils.logging import (
+    update_loss_breakdown,
+    zero_breakdown,
+    zero_cls_metrics,
+)
+from goose_semseg.utils.metrics import compute_mean_iou, update_confusion_matrix
+
+
+def run_epoch(
+    *,
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: Mask2FormerSetCriterion,
+    optimizer: Optional[AdamW],
+    scaler: torch.amp.GradScaler,
+    device: torch.device,
+    amp: bool,
+    grad_clip_norm: float,
+    grad_accum_steps: int,
+    num_classes: int,
+    ignore_index: int,
+    epoch: int,
+    epochs: int,
+    enable_cls_aux: bool,
+    cls_aux_target_type: str,
+    cls_aux_loss_type: str,
+    cls_aux_weight: float,
+    cls_aux_num_classes: int,
+    cls_aux_pos_weight: Optional[torch.Tensor],
+    iter_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+) -> Tuple[float, float, Dict[str, float], Dict[str, float], torch.Tensor]:
+    is_train = optimizer is not None
+    model.train(is_train)
+    criterion.train(is_train)
+
+    total_loss = 0.0
+    total_batches = 0
+    total_breakdown = zero_breakdown()
+    cls_correct = 0.0
+    cls_count = 0.0
+    confusion_matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64, device=device)
+    progress = tqdm(
+        loader,
+        desc=f"Epoch {epoch + 1}/{epochs} {'train' if is_train else 'val'}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
+
+    if enable_cls_aux and cls_aux_loss_type == "weighted_bce":
+        if cls_aux_pos_weight is None:
+            raise ValueError("weighted_bce for cls_aux requires cls_aux_pos_weight.")
+        cls_aux_pos_weight = cls_aux_pos_weight.to(device=device, non_blocking=True)
+
+    for step, (images, labels) in enumerate(progress, start=1):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.set_grad_enabled(is_train):
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=amp and device.type == "cuda",
+                dtype=torch.bfloat16,
+            ):
+                outputs = model(images)
+                loss, loss_dict = criterion(outputs, labels)
+                if enable_cls_aux:
+                    cls_logits = outputs.get("cls_logits")
+                    if cls_logits is None:
+                        raise ValueError("CLS auxiliary supervision is enabled, but the model did not return cls_logits.")
+                    cls_targets = build_batch_cls_aux_targets(
+                        labels,
+                        target_type=cls_aux_target_type,
+                        num_classes=num_classes,
+                        num_coarse=cls_aux_num_classes,
+                        ignore_index=ignore_index,
+                    )
+                    if cls_logits.shape[-1] != cls_targets.shape[-1]:
+                        raise ValueError(
+                            "CLS auxiliary head output dim does not match target dim: "
+                            f"logits={cls_logits.shape[-1]} targets={cls_targets.shape[-1]} "
+                            f"(target_type={cls_aux_target_type!r})."
+                        )
+                    raw_cls_loss = F.binary_cross_entropy_with_logits(
+                        cls_logits.float(),
+                        cls_targets,
+                        pos_weight=cls_aux_pos_weight if cls_aux_loss_type == "weighted_bce" else None,
+                    )
+                    weighted_cls_loss = raw_cls_loss * cls_aux_weight
+                    loss = loss + weighted_cls_loss
+                    loss_dict = dict(loss_dict)
+                    loss_dict["loss_cls_aux"] = weighted_cls_loss.detach()
+
+                    cls_predictions = torch.sigmoid(cls_logits.float()) >= 0.5
+                    cls_correct += float((cls_predictions == cls_targets.bool()).sum().item())
+                    cls_count += float(cls_targets.numel())
+                semantic_scores = mask2former_semantic_scores(
+                    outputs,
+                    target_size=labels.shape[-2:],
+                )
+
+        if is_train:
+            scaler.scale(loss / grad_accum_steps).backward()
+            should_step = (step % grad_accum_steps == 0) or (step == len(loader))
+            if should_step:
+                scaler.unscale_(optimizer)
+                params_to_clip = [
+                    param
+                    for group in optimizer.param_groups
+                    for param in group["params"]
+                    if param.grad is not None
+                ]
+                if params_to_clip:
+                    torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if iter_scheduler is not None:
+                    iter_scheduler.step()
+
+        total_loss += float(loss.detach().item())
+        total_batches += 1
+        update_loss_breakdown(total_breakdown, loss_dict, criterion)
+
+        predictions = semantic_scores.argmax(dim=1)
+        update_confusion_matrix(confusion_matrix, predictions, labels, num_classes, ignore_index)
+        progress.set_postfix(
+            loss=f"{total_loss / max(total_batches, 1):.4f}",
+            miou=f"{compute_mean_iou(confusion_matrix):.4f}",
+        )
+
+    mean_loss = total_loss / max(total_batches, 1)
+    mean_breakdown = {
+        key: value / max(total_batches, 1) for key, value in total_breakdown.items()
+    }
+    cls_metrics = zero_cls_metrics()
+    if enable_cls_aux and cls_count > 0.0:
+        cls_metrics["cls_aux_accuracy"] = cls_correct / cls_count
+    return (
+        mean_loss,
+        compute_mean_iou(confusion_matrix),
+        mean_breakdown,
+        cls_metrics,
+        confusion_matrix.detach().cpu(),
+    )

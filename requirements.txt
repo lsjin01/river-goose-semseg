@@ -1,0 +1,12 @@
+torch>=2.0
+torchvision>=0.15
+transformers>=4.40
+timm>=0.9
+numpy
+pillow
+pyyaml
+tqdm
+einops
+packaging
+scipy
+matplotlib

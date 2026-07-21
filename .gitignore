@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+
+# IDE / OS / local agent settings
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Local datasets and generated artifacts
+/data/
+dataset/
+goose_data*/
+LabelingExample/
+outputs/
+outputs_old/
+viz*/
+*.pt
+*.pth
+*.ckpt
+*.log
+*.zip
+*.tar
+
+# Retired nested checkout (kept locally for reference)
+goose-semseg-icra2026/
