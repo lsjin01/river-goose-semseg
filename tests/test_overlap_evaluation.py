@@ -1,6 +1,6 @@
 import unittest
 
-from tools.evaluate_overlap_test import aligned_positions
+from goose_semseg.data.spectral_tiles import aligned_tile_positions as aligned_positions
 
 
 class OverlapEvaluationTests(unittest.TestCase):

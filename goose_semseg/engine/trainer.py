@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -47,6 +48,8 @@ def run_epoch(
     cls_aux_fine_to_coarse: Optional[Dict[int, int]] = None,
 ) -> Tuple[float, float, Dict[str, float], Dict[str, float], torch.Tensor]:
     is_train = optimizer is not None
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
     model.train(is_train)
     criterion.train(is_train)
 
@@ -66,6 +69,7 @@ def run_epoch(
         desc=f"Epoch {epoch + 1}/{epochs} {'train' if is_train else 'val'}",
         dynamic_ncols=True,
         leave=False,
+        disable=rank != 0,
     )
 
     if is_train:
@@ -168,13 +172,26 @@ def run_epoch(
             miou=f"{compute_mean_iou(confusion_matrix, gt_present_only):.4f}",
         )
 
-    mean_loss = total_loss / max(total_batches, 1)
+    scalar_names = list(total_breakdown)
+    scalars = torch.tensor(
+        [total_loss, total_batches, cls_correct, cls_count]
+        + [total_breakdown[name] for name in scalar_names],
+        dtype=torch.float64,
+        device=device,
+    )
+    if distributed:
+        dist.all_reduce(scalars, op=dist.ReduceOp.SUM)
+        dist.all_reduce(confusion_matrix, op=dist.ReduceOp.SUM)
+    global_batches = max(float(scalars[1].item()), 1.0)
+    mean_loss = float(scalars[0].item() / global_batches)
     mean_breakdown = {
-        key: value / max(total_batches, 1) for key, value in total_breakdown.items()
+        name: float(scalars[index + 4].item() / global_batches)
+        for index, name in enumerate(scalar_names)
     }
     cls_metrics = zero_cls_metrics()
-    if enable_cls_aux and cls_count > 0.0:
-        cls_metrics["cls_aux_accuracy"] = cls_correct / cls_count
+    global_cls_count = float(scalars[3].item())
+    if enable_cls_aux and global_cls_count > 0.0:
+        cls_metrics["cls_aux_accuracy"] = float(scalars[2].item()) / global_cls_count
     if group_confusion_matrices is not None:
         for group in group_confusion_matrices:
             group_confusion_matrices[group] = group_confusion_matrices[group].detach().cpu()

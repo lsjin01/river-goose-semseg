@@ -18,7 +18,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'third_party')]
 import torch
 from torch.utils.data import DataLoader
 
-from goose_semseg.data.spectral_tiles import SpectralTileDataset
+from goose_semseg.data.spectral_tiles import OverlapSpectralTileDataset, aligned_tile_positions
 from goose_semseg.models.backbone.loader import load_dinov3_backbone
 from goose_semseg.models.builder import BackboneLayersSet, build_segmentation_decoder
 from goose_semseg.models.head_utils import mask2former_semantic_scores
@@ -30,30 +30,7 @@ from goose_semseg.utils.metrics import compute_mean_iou, per_class_metric_rows, 
 from goose_semseg.utils.seed import seed_everything
 
 
-def aligned_positions(length: int, tile_size: int, stride: int) -> list[int]:
-    """Cover an axis without padding and force the final window against the far edge."""
-    if length < tile_size:
-        raise ValueError(f'Image axis {length} is smaller than tile size {tile_size}')
-    positions = list(range(0, length - tile_size + 1, stride))
-    final = length - tile_size
-    if positions[-1] != final:
-        positions.append(final)
-    return positions
-
-
-class OverlapSpectralTileDataset(SpectralTileDataset):
-    def __init__(self, root, split: str, tile_size: int, stride: int):
-        if split == 'train':
-            raise ValueError('Overlap evaluation dataset is not a training sampler')
-        if not 0 < stride < tile_size:
-            raise ValueError('Overlap stride must lie in (0, tile_size)')
-        super().__init__(root, split, tile_size)
-        self.stride = int(stride)
-        self.tiles = []
-        for frame_index, record in enumerate(self.records):
-            tops = aligned_positions(record['height'], self.tile_size, self.stride)
-            lefts = aligned_positions(record['width'], self.tile_size, self.stride)
-            self.tiles.extend((frame_index, left, top) for top in tops for left in lefts)
+aligned_positions = aligned_tile_positions
 
 
 def atomic_json(path: Path, payload: dict) -> None:

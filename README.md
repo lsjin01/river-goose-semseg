@@ -283,6 +283,10 @@ CLS-aux 재학습 설정은 `config/labeling_coarse_aux.yaml`, 실행 도구는 
 이 실행에는 DataParallel에서 ViT가 잘못 no_grad로 실행되던 오류 수정도 포함되어 있어,
 이전 V3 결과와의 차이를 CLS-aux 단독 효과로 해석하면 안 됩니다. 자세한 내용은 위 문서를 참고하십시오.
 
+7-class 모델을 두 GPU DDP로 fresh 학습하고, padding 없는 overlap validation으로
+checkpoint를 선택하는 최신 설정은
+[7-class fresh DDP + overlap validation](docs/merged_algae_7class_ddp.md)을 참고하십시오.
+
 - 실험 설정은 `config/` 또는 각 실행의 `train_args.json`으로 관리합니다.
 - 학습 데이터와 체크포인트는 Git 대신 외부 스토리지나 Git LFS로 관리하십시오.
 - 공개 전 데이터 라이선스와 개인정보 포함 여부를 반드시 확인하십시오.

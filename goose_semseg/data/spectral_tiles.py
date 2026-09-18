@@ -142,3 +142,38 @@ class SpectralTileDataset(Dataset):
         if self.split=='train' and random.random()<self.flip_prob:
             image,label = image[:,:,::-1].copy(),label[:,::-1].copy()
         return torch.from_numpy(image),torch.from_numpy(label.astype(np.int64))
+
+
+def aligned_tile_positions(length: int, tile_size: int, stride: int) -> list[int]:
+    """Cover an axis without padding and align the last tile to the far edge."""
+    if length < tile_size:
+        raise ValueError(f'Image axis {length} is smaller than tile size {tile_size}')
+    if not 0 < stride <= tile_size:
+        raise ValueError('Stride must lie in (0, tile_size]')
+    positions = list(range(0, length - tile_size + 1, stride))
+    final = length - tile_size
+    if positions[-1] != final:
+        positions.append(final)
+    return positions
+
+
+class OverlapSpectralTileDataset(SpectralTileDataset):
+    """Padding-free evaluation tiles, optionally restricted to whole frames."""
+
+    def __init__(self, root, split: str, tile_size: int, stride: int,
+                 record_indices=None):
+        if split == 'train':
+            raise ValueError('Overlap evaluation dataset is not a training sampler')
+        if not 0 < stride < tile_size:
+            raise ValueError('Overlap stride must lie in (0, tile_size)')
+        super().__init__(root, split, tile_size)
+        self.all_records = self.records
+        if record_indices is not None:
+            selected = [int(index) for index in record_indices]
+            self.records = [self.all_records[index] for index in selected]
+        self.stride = int(stride)
+        self.tiles = []
+        for frame_index, record in enumerate(self.records):
+            tops = aligned_tile_positions(record['height'], self.tile_size, self.stride)
+            lefts = aligned_tile_positions(record['width'], self.tile_size, self.stride)
+            self.tiles.extend((frame_index, left, top) for top in tops for left in lefts)

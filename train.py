@@ -12,11 +12,15 @@ for _p in (_REPO, _REPO / "third_party"):
 import argparse
 import json
 import math
+import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from goose_semseg.data.dataset import GooseSegmentationDataset
 from goose_semseg.engine.trainer import run_epoch
@@ -134,6 +138,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class_sampling_mode", choices=['global', 'within_image'], default='global')
     parser.add_argument("--val_group_metrics", action='store_true')
     parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument(
+        "--overlap_val_stride",
+        type=int,
+        default=0,
+        help="If >0, select checkpoints with padding-free full-frame overlap validation.",
+    )
+    parser.add_argument(
+        "--overlap_val_batch_size",
+        type=int,
+        default=8,
+        help="Per-GPU batch size for overlap validation.",
+    )
     parser.add_argument(
         "--fusion_type",
         choices=["input", "indices", "late", "gated", "cross_attention"],
@@ -257,15 +273,33 @@ def main() -> None:
         if args.cls_aux_loss_type == 'weighted_bce':
             raise ValueError('source_tiles auxiliary currently supports bce only; '
                              'image-presence weights do not represent sampled crops')
-    seed_everything(args.seed)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    distributed = world_size > 1
+    if distributed:
+        if args.data_parallel:
+            raise ValueError('--data_parallel cannot be combined with torchrun DDP')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        rank = int(os.environ['RANK'])
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://', device_id=device)
+    else:
+        local_rank = 0
+        rank = 0
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0
+    args.distributed_world_size = world_size
+    seed_everything(args.seed + rank)
     if device.type != "cuda":
         raise RuntimeError("This trainer expects a CUDA GPU for DINOv3 ViT-L + Mask2Former.")
 
     run_dir = Path(args.output_dir).expanduser().resolve() / args.run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with (run_dir / "train_args.json").open("w", encoding="utf-8") as fp:
-        json.dump(vars(args), fp, indent=2)
+    if is_main:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "train_args.json").open("w", encoding="utf-8") as fp:
+            json.dump(vars(args), fp, indent=2)
+    if distributed:
+        dist.barrier()
 
     resize_size = (args.resize_width, args.resize_height)
     if args.source_tiles:
@@ -274,7 +308,8 @@ def main() -> None:
         if args.segmentation_taxonomy == 'binary_algae':
             from goose_semseg.data.binary_algae import BinaryAlgaeTileDataset, binary_taxonomy_metadata
             dataset_class = BinaryAlgaeTileDataset
-            (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(binary_taxonomy_metadata(), indent=2))
+            if is_main:
+                (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(binary_taxonomy_metadata(), indent=2))
         if args.input_channels != 9:
             raise ValueError('source_tiles requires input_channels=9')
         train_dataset = dataset_class(args.data_path, 'train', args.tile_size,
@@ -282,28 +317,32 @@ def main() -> None:
                                            args.class_sampling_mode)
         val_dataset = dataset_class(args.data_path, 'val', args.tile_size)
         if args.segmentation_taxonomy == 'binary_algae' and train_dataset.native_binary:
-            (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(dict(
-                name='binary_algae',class_names=train_dataset.manifest['class_names'],
-                annotation_label_key='label_id',ignore_index=255,source_annotations_unchanged=True,
-                **train_dataset.manifest['taxonomy']),indent=2))
+            if is_main:
+                (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(dict(
+                    name='binary_algae',class_names=train_dataset.manifest['class_names'],
+                    annotation_label_key='label_id',ignore_index=255,source_annotations_unchanged=True,
+                    **train_dataset.manifest['taxonomy']),indent=2))
         if args.segmentation_taxonomy == 'merged_algae_7class':
             from goose_semseg.data.merged_algae import CLASS_NAMES, taxonomy_metadata
             if train_dataset.manifest.get('annotation_label_key') != 'label_id':
                 raise ValueError('merged_algae_7class requires a native label_id manifest')
             if train_dataset.manifest['class_names'] != list(CLASS_NAMES):
                 raise ValueError('merged_algae_7class manifest class order does not match the model')
-            (run_dir/'segmentation_taxonomy.json').write_text(
-                json.dumps(taxonomy_metadata(), indent=2)
-            )
+            if is_main:
+                (run_dir/'segmentation_taxonomy.json').write_text(
+                    json.dumps(taxonomy_metadata(), indent=2)
+                )
         if cls_aux_fine_to_coarse is not None:
             from goose_semseg.data.labeling_taxonomy import COARSE_NAMES, fine_to_coarse_mapping
             cls_aux_fine_to_coarse = fine_to_coarse_mapping(train_dataset.manifest['class_names'])
-            (run_dir/'cls_aux_taxonomy.json').write_text(json.dumps(dict(
-                fine_names=train_dataset.manifest['class_names'], coarse_names=COARSE_NAMES,
-                fine_to_coarse=cls_aux_fine_to_coarse), indent=2))
+            if is_main:
+                (run_dir/'cls_aux_taxonomy.json').write_text(json.dumps(dict(
+                    fine_names=train_dataset.manifest['class_names'], coarse_names=COARSE_NAMES,
+                    fine_to_coarse=cls_aux_fine_to_coarse), indent=2))
         import hashlib
         manifest_bytes = (Path(args.data_path)/'manifest.json').read_bytes()
-        (run_dir/'dataset_manifest_sha256.txt').write_text(hashlib.sha256(manifest_bytes).hexdigest())
+        if is_main:
+            (run_dir/'dataset_manifest_sha256.txt').write_text(hashlib.sha256(manifest_bytes).hexdigest())
     else:
         train_dataset = GooseSegmentationDataset(
             args.data_path,
@@ -327,7 +366,14 @@ def main() -> None:
             flip_prob=0.0,
             input_channels=args.input_channels,
         )
-    print(f"Loaded {len(train_dataset)} train samples and {len(val_dataset)} val samples.")
+    if distributed and args.overlap_val_stride <= 0:
+        raise ValueError('DDP source-tile training requires --overlap_val_stride > 0')
+    if args.overlap_val_stride > 0 and not args.source_tiles:
+        raise ValueError('Overlap validation requires --source_tiles')
+    if args.overlap_val_stride > 0 and args.enable_cls_aux:
+        raise ValueError('Overlap validation with CLS auxiliary is not implemented')
+    if is_main:
+        print(f"Loaded {len(train_dataset)} train samples and {len(val_dataset)} val samples.")
 
     loader_kwargs = {
         "num_workers": args.num_workers,
@@ -336,22 +382,36 @@ def main() -> None:
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        if distributed else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=True,
-        generator=torch.Generator().manual_seed(args.seed),
+        generator=torch.Generator().manual_seed(args.seed + rank),
         **loader_kwargs,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=(args.val_batch_size or args.batch_size),
-        shuffle=False,
-        drop_last=False,
-        generator=torch.Generator().manual_seed(args.seed + 1),
-        **loader_kwargs,
-    )
+    val_loader = None
+    if args.overlap_val_stride <= 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=(args.val_batch_size or args.batch_size),
+            shuffle=False,
+            drop_last=False,
+            generator=torch.Generator().manual_seed(args.seed + 1),
+            **loader_kwargs,
+        )
 
     backbone = load_dinov3_backbone(args)
 
@@ -530,7 +590,17 @@ def main() -> None:
         best_val_miou = float(checkpoint.get("best_val_miou", best_val_miou))
         print(f"Resumed from {args.resume_from} at epoch {start_epoch}.")
 
-    if args.data_parallel:
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
+        if is_main:
+            print(f'DDP enabled across {world_size} GPUs; per-GPU batch={args.batch_size}.')
+    elif args.data_parallel:
         visible_device_count = torch.cuda.device_count()
         if visible_device_count < 2:
             raise RuntimeError(
@@ -554,6 +624,8 @@ def main() -> None:
                     previous_best, last_improved = float(row['val_miou']), int(row['epoch'])
             epochs_without_improvement = sum(last_improved < int(row['epoch']) <= start_epoch for row in history)
     for epoch in range(start_epoch, args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_loss, train_miou, train_breakdown, train_cls_metrics, train_confusion_matrix = run_epoch(
             model=model,
             loader=train_loader,
@@ -578,48 +650,85 @@ def main() -> None:
             iter_scheduler=scheduler,
             gt_present_only=args.source_tiles,
         )
-        if args.val_group_metrics:
+        if is_main and args.val_group_metrics:
             append_per_class_metrics(run_dir/'train_per_class_metrics.csv', epoch, train_confusion_matrix)
         if (epoch + 1) % max(1, args.val_interval) != 0 and epoch + 1 != args.epochs:
-            print(f'epoch={epoch+1} train_loss={train_loss:.4f} train_miou={train_miou:.4f} validation=scheduled')
-            progress = dict(epoch=epoch+1, train_loss=train_loss, train_miou=train_miou,
-                            best_val_miou=best_val_miou)
-            if args.enable_cls_aux:
-                progress.update(train_cls_aux_loss=train_breakdown['loss_cls_aux'],
-                                train_cls_aux_accuracy=train_cls_metrics['cls_aux_accuracy'])
-                print(f"  train_cls_aux_loss={train_breakdown['loss_cls_aux']:.6f} "
-                      f"train_cls_aux_acc={train_cls_metrics['cls_aux_accuracy']:.4f}")
-            (run_dir/'progress.json').write_text(json.dumps(progress))
-            save_checkpoint(run_dir/'latest.pt',model=model,optimizer=optimizer,scaler=scaler,
-                scheduler=scheduler,epoch=epoch,best_val_miou=best_val_miou,args=args)
+            if is_main:
+                print(f'epoch={epoch+1} train_loss={train_loss:.4f} train_miou={train_miou:.4f} validation=scheduled')
+                progress = dict(epoch=epoch+1, train_loss=train_loss, train_miou=train_miou,
+                                best_val_miou=best_val_miou)
+                if args.enable_cls_aux:
+                    progress.update(train_cls_aux_loss=train_breakdown['loss_cls_aux'],
+                                    train_cls_aux_accuracy=train_cls_metrics['cls_aux_accuracy'])
+                    print(f"  train_cls_aux_loss={train_breakdown['loss_cls_aux']:.6f} "
+                          f"train_cls_aux_acc={train_cls_metrics['cls_aux_accuracy']:.4f}")
+                (run_dir/'progress.json').write_text(json.dumps(progress))
+                save_checkpoint(run_dir/'latest.pt',model=model,optimizer=optimizer,scaler=scaler,
+                    scheduler=scheduler,epoch=epoch,best_val_miou=best_val_miou,args=args)
+            if distributed:
+                dist.barrier()
             continue
-        val_groups = {} if args.val_group_metrics and args.source_tiles else None
-        val_loss, val_miou, val_breakdown, val_cls_metrics, val_confusion_matrix = run_epoch(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            optimizer=None,
-            scaler=scaler,
-            device=device,
-            amp=not args.no_amp,
-            grad_clip_norm=args.grad_clip_norm,
-            grad_accum_steps=1,
-            num_classes=args.num_classes,
-            ignore_index=args.ignore_index,
-            epoch=epoch,
-            epochs=args.epochs,
-            enable_cls_aux=args.enable_cls_aux,
-            cls_aux_target_type=args.cls_aux_target_type,
-            cls_aux_loss_type=args.cls_aux_loss_type,
-            cls_aux_weight=args.cls_aux_weight,
-            cls_aux_num_classes=args.cls_aux_num_classes,
-            cls_aux_pos_weight=cls_aux_pos_weight,
-            cls_aux_fine_to_coarse=cls_aux_fine_to_coarse,
-            gt_present_only=args.source_tiles,
-            group_confusion_matrices=val_groups,
-        )
+        if args.overlap_val_stride > 0:
+            from goose_semseg.data.spectral_tiles import OverlapSpectralTileDataset
+            from goose_semseg.engine.overlap_validation import evaluate_overlap
+            all_val_records = val_dataset.records
+            local_record_indices = list(range(rank, len(all_val_records), world_size))
+            overlap_dataset = OverlapSpectralTileDataset(
+                args.data_path,
+                'val',
+                args.tile_size,
+                args.overlap_val_stride,
+                record_indices=local_record_indices,
+            )
+            (
+                val_loss,
+                val_miou,
+                val_breakdown,
+                val_cls_metrics,
+                val_confusion_matrix,
+                val_groups,
+            ) = evaluate_overlap(
+                model=model,
+                dataset=overlap_dataset,
+                criterion=criterion,
+                device=device,
+                batch_size=args.overlap_val_batch_size,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                num_classes=args.num_classes,
+                ignore_index=args.ignore_index,
+                tile_size=args.tile_size,
+                epoch=epoch,
+                epochs=args.epochs,
+            )
+        else:
+            val_groups = {} if args.val_group_metrics and args.source_tiles else None
+            val_loss, val_miou, val_breakdown, val_cls_metrics, val_confusion_matrix = run_epoch(
+                model=model,
+                loader=val_loader,
+                criterion=criterion,
+                optimizer=None,
+                scaler=scaler,
+                device=device,
+                amp=not args.no_amp,
+                grad_clip_norm=args.grad_clip_norm,
+                grad_accum_steps=1,
+                num_classes=args.num_classes,
+                ignore_index=args.ignore_index,
+                epoch=epoch,
+                epochs=args.epochs,
+                enable_cls_aux=args.enable_cls_aux,
+                cls_aux_target_type=args.cls_aux_target_type,
+                cls_aux_loss_type=args.cls_aux_loss_type,
+                cls_aux_weight=args.cls_aux_weight,
+                cls_aux_num_classes=args.cls_aux_num_classes,
+                cls_aux_pos_weight=cls_aux_pos_weight,
+                cls_aux_fine_to_coarse=cls_aux_fine_to_coarse,
+                gt_present_only=args.source_tiles,
+                group_confusion_matrices=val_groups,
+            )
 
-        if val_groups is not None:
+        if is_main and val_groups is not None:
             from goose_semseg.utils.metrics import compute_mean_iou, per_class_metric_rows
             val_groups['overall'] = val_confusion_matrix
             grouped = {}
@@ -635,7 +744,8 @@ def main() -> None:
                     confusion_matrix=matrix.tolist(), per_class=rows)
             (run_dir/f'val_groups_epoch_{epoch+1:03d}.json').write_text(json.dumps(dict(
                 epoch=epoch+1, tta=False, metrics=grouped,
-                metric_definition='Each group averages its GT-supported classes; compare identical groups across runs.'
+                metric_definition=('Padding-free overlap score blending; each group averages its '
+                                   'GT-supported classes; compare identical groups across runs.')
             ), indent=2, allow_nan=False))
 
         log_message = (
@@ -647,8 +757,9 @@ def main() -> None:
                 f" train_cls_aux_acc={train_cls_metrics['cls_aux_accuracy']:.4f}"
                 f" val_cls_aux_acc={val_cls_metrics['cls_aux_accuracy']:.4f}"
             )
-        print(log_message)
-        if scheduler is not None:
+        if is_main:
+            print(log_message)
+        if is_main and scheduler is not None:
             current_lrs = [group["lr"] for group in optimizer.param_groups]
             print(f"  current_lrs={current_lrs}")
 
@@ -656,9 +767,30 @@ def main() -> None:
         if improved:
             best_val_miou = val_miou
             epochs_without_improvement = 0
-            best_checkpoint_path = run_dir / f"best_epoch_{epoch + 1:03d}_miou_{val_miou:.4f}.pt"
+            if is_main:
+                best_checkpoint_path = run_dir / f"best_epoch_{epoch + 1:03d}_miou_{val_miou:.4f}.pt"
+                save_checkpoint(
+                    best_checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    best_val_miou=best_val_miou,
+                    args=args,
+                )
+                if args.max_best_checkpoints > 0:
+                    previous_best = sorted(
+                        path for path in run_dir.glob("best_epoch_*.pt") if path != best_checkpoint_path
+                    )
+                    for obsolete in previous_best[:max(0, len(previous_best) - args.max_best_checkpoints + 1)]:
+                        obsolete.unlink()
+        else:
+            epochs_without_improvement += 1
+
+        if is_main:
             save_checkpoint(
-                best_checkpoint_path,
+                run_dir / "latest.pt",
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -667,65 +799,53 @@ def main() -> None:
                 best_val_miou=best_val_miou,
                 args=args,
             )
-            if args.max_best_checkpoints > 0:
-                previous_best = sorted(
-                    path for path in run_dir.glob("best_epoch_*.pt") if path != best_checkpoint_path
-                )
-                for obsolete in previous_best[:max(0, len(previous_best) - args.max_best_checkpoints + 1)]:
-                    obsolete.unlink()
-        else:
-            epochs_without_improvement += 1
-
-        save_checkpoint(
-            run_dir / "latest.pt",
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            scheduler=scheduler,
-            epoch=epoch,
-            best_val_miou=best_val_miou,
-            args=args,
-        )
-        append_epoch_log(
-            run_dir / "epoch_metrics.csv",
-            epoch,
-            train_loss,
-            train_miou,
-            val_loss,
-            val_miou,
-            best_val_miou,
-            train_breakdown,
-            val_breakdown,
-            train_cls_metrics,
-            val_cls_metrics,
-        )
-        append_per_class_metrics(
-            run_dir / "val_per_class_metrics.csv",
-            epoch,
-            val_confusion_matrix,
-        )
-        append_presence_summary(
-            run_dir / "val_presence_summary.csv",
-            epoch,
-            val_confusion_matrix,
-        )
-        if args.source_tiles:
-            (run_dir/'progress.json').write_text(json.dumps(dict(epoch=epoch+1,
-                train_loss=train_loss, train_miou=train_miou, val_loss=val_loss,
-                val_miou=val_miou, best_val_miou=best_val_miou)))
+            append_epoch_log(
+                run_dir / "epoch_metrics.csv",
+                epoch,
+                train_loss,
+                train_miou,
+                val_loss,
+                val_miou,
+                best_val_miou,
+                train_breakdown,
+                val_breakdown,
+                train_cls_metrics,
+                val_cls_metrics,
+            )
+            append_per_class_metrics(
+                run_dir / "val_per_class_metrics.csv",
+                epoch,
+                val_confusion_matrix,
+            )
+            append_presence_summary(
+                run_dir / "val_presence_summary.csv",
+                epoch,
+                val_confusion_matrix,
+            )
+            if args.source_tiles:
+                (run_dir/'progress.json').write_text(json.dumps(dict(epoch=epoch+1,
+                    train_loss=train_loss, train_miou=train_miou, val_loss=val_loss,
+                    val_miou=val_miou, best_val_miou=best_val_miou)))
+        if distributed:
+            dist.barrier()
 
         if epochs_without_improvement >= args.early_stopping_patience:
-            print(f"Early stopping after {epochs_without_improvement} epochs without mIoU improvement.")
+            if is_main:
+                print(f"Early stopping after {epochs_without_improvement} epochs without mIoU improvement.")
             break
 
-    print(f"Done. Best val mIoU: {best_val_miou:.4f}. Output: {run_dir}")
-    if args.source_tiles:
+    if is_main:
+        print(f"Done. Best val mIoU: {best_val_miou:.4f}. Output: {run_dir}")
+    if is_main and args.source_tiles:
         if not math.isfinite(best_val_miou):
             raise RuntimeError('Training ended without a finite validation result')
         (run_dir/'training_complete.json').write_text(json.dumps({
             'best_val_miou':best_val_miou, 'status':'completed',
             'manifest_sha256':(run_dir/'dataset_manifest_sha256.txt').read_text(),
         }, indent=2))
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

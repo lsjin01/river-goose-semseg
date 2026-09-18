@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 
@@ -44,7 +45,11 @@ def save_checkpoint(
     best_val_miou: float,
     args: argparse.Namespace,
 ) -> None:
-    checkpoint_model = model.module if isinstance(model, nn.DataParallel) else model
+    checkpoint_model = (
+        model.module
+        if isinstance(model, (nn.DataParallel, DistributedDataParallel))
+        else model
+    )
     payload = {
         "epoch": epoch,
         "best_val_miou": best_val_miou,
