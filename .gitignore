@@ -19,12 +19,15 @@ dist/
 
 # Local datasets and generated artifacts
 /data/
+/Labeling_Data
+/Labeling_Data_v2/
 dataset/
 goose_data*/
 LabelingExample/
 outputs/
 outputs_old/
 viz*/
+/docs/assets/lab_meeting_sensor_samples/
 *.pt
 *.pth
 *.ckpt

@@ -52,6 +52,147 @@ def _get_backbone_out_indices(
     return out_indices
 
 
+class SpectralInputAdapter(torch.nn.Module):
+    """Learn a multispectral-to-RGB representation for an RGB-pretrained backbone."""
+
+    def __init__(self, in_channels: int, hidden_channels: int = 16, add_indices: bool = False,
+                 precomputed_indices: bool = False):
+        super().__init__()
+        if in_channels < 3:
+            raise ValueError("SpectralInputAdapter requires at least three channels.")
+        self.add_indices = add_indices
+        self.precomputed_indices = precomputed_indices
+        adapter_channels = (in_channels if add_indices else in_channels - 2) if precomputed_indices else in_channels + 2 * int(add_indices)
+        self.rgb_projection = torch.nn.Conv2d(adapter_channels, 3, kernel_size=1, bias=False)
+        self.spectral_residual = torch.nn.Sequential(
+            torch.nn.Conv2d(adapter_channels, hidden_channels, kernel_size=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(hidden_channels, 3, kernel_size=1),
+        )
+        self.register_buffer(
+            "mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1), persistent=False
+        )
+        self.register_buffer(
+            "std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1), persistent=False
+        )
+        with torch.no_grad():
+            self.rgb_projection.weight.zero_()
+            # Input order is Blue, Green, Red, NIR, RedEdge, Thermal.
+            self.rgb_projection.weight[0, 2, 0, 0] = 1.0
+            self.rgb_projection.weight[1, 1, 0, 0] = 1.0
+            self.rgb_projection.weight[2, 0, 0, 0] = 1.0
+            self.spectral_residual[-1].weight.zero_()
+            self.spectral_residual[-1].bias.zero_()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.precomputed_indices:
+            if not self.add_indices:
+                inputs = inputs[:, :-2]
+        elif self.add_indices:
+            red, nir, edge = inputs[:, 2:3], inputs[:, 3:4], inputs[:, 4:5]
+            available = (inputs[:, 3:6].abs().sum((1,2,3),keepdim=True)>0).to(inputs.dtype)
+            inputs = torch.cat((inputs, available*(nir-red)/(nir+red+1e-6),
+                                available*(nir-edge)/(nir+edge+1e-6)),dim=1)
+        rgb_like = self.rgb_projection(inputs) + self.spectral_residual(inputs)
+        return (rgb_like - self.mean) / self.std
+
+
+class SpectralFeatureFusion(torch.nn.Module):
+    """Fuse extra spectral bands with DINOv3 features."""
+
+    def __init__(self, backbone: torch.nn.Module, mode: str, embed_dim: int, spectral_channels: int = 3,
+                 improved_fusion: bool = False):
+        super().__init__()
+        self.backbone = backbone
+        self.mode = mode
+        self.spectral_channels = spectral_channels
+        self.improved_fusion = improved_fusion
+        self.register_buffer(
+            "mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1), persistent=False
+        )
+        self.register_buffer(
+            "std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1), persistent=False
+        )
+        self.spectral_stem = torch.nn.Sequential(
+            torch.nn.Conv2d(spectral_channels, 64, kernel_size=3, stride=4 if improved_fusion else 1, padding=1, bias=False),
+            torch.nn.GroupNorm(8, 64),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            torch.nn.GroupNorm(8, 64),
+            torch.nn.GELU(),
+        )
+        if mode == "late":
+            self.projections = torch.nn.ModuleDict({"4": torch.nn.Conv2d(64, embed_dim, 1, bias=False)})
+        elif mode == "gated":
+            self.projections = torch.nn.ModuleDict({
+                level: torch.nn.Conv2d(64, embed_dim, 1, bias=False)
+                for level in ("1", "2", "3", "4")
+            })
+            self.gates = torch.nn.ModuleDict({
+                level: torch.nn.Conv2d(64 + (embed_dim if improved_fusion else 0), 1, 1)
+                for level in ("1", "2", "3", "4")
+            })
+        elif mode == "cross_attention":
+            self.spectral_projection = torch.nn.Conv2d(64, embed_dim, 1, bias=False)
+            self.cross_attention = torch.nn.MultiheadAttention(
+                embed_dim, num_heads=8, dropout=0.1, batch_first=True
+            )
+            self.cross_norm = torch.nn.LayerNorm(embed_dim)
+            self.cross_scale = torch.nn.Parameter(torch.tensor(0.1))
+        else:
+            raise ValueError(f"Unsupported feature fusion mode: {mode}")
+        if improved_fusion:
+            # Begin at the RGB pretrained representation while fusion learns.
+            with torch.no_grad():
+                if mode in ('late', 'gated'):
+                    for projection in self.projections.values():
+                        projection.weight.zero_()
+                else:
+                    self.cross_scale.fill_(0.0)
+
+    def _rgb_input(self, inputs: torch.Tensor) -> torch.Tensor:
+        rgb = torch.stack((inputs[:, 2], inputs[:, 1], inputs[:, 0]), dim=1)
+        return (rgb - self.mean) / self.std
+
+    def forward(self, inputs: torch.Tensor):
+        backbone_outputs = self.backbone(self._rgb_input(inputs))
+        cls_feature = None
+        if isinstance(backbone_outputs, tuple):
+            features, cls_feature = backbone_outputs
+        else:
+            features = backbone_outputs
+
+        extra = inputs[:, 3:3+self.spectral_channels]
+        spectral = self.spectral_stem(extra)
+        has_spectral = (extra.abs().sum(dim=(1, 2, 3), keepdim=True) > 0).to(extra.dtype)
+        fused = dict(features)
+
+        if self.mode == "late":
+            level = "4"
+            spec = torch.nn.functional.interpolate(
+                spectral, size=features[level].shape[-2:], mode="bilinear", align_corners=False
+            )
+            fused[level] = features[level] + has_spectral * self.projections[level](spec)
+        elif self.mode == "gated":
+            for level in ("1", "2", "3", "4"):
+                spec = torch.nn.functional.interpolate(
+                    spectral, size=features[level].shape[-2:], mode="bilinear", align_corners=False
+                )
+                gate_input = torch.cat((features[level],spec),dim=1) if self.improved_fusion else spec
+                gate = torch.sigmoid(self.gates[level](gate_input))
+                fused[level] = features[level] + has_spectral * gate * self.projections[level](spec)
+        else:
+            level = "4"
+            pooled = torch.nn.functional.adaptive_avg_pool2d(spectral, (8, 8))
+            spectral_tokens = self.spectral_projection(pooled).flatten(2).transpose(1, 2)
+            rgb_feature = features[level]
+            rgb_tokens = rgb_feature.flatten(2).transpose(1, 2)
+            attended, _ = self.cross_attention(rgb_tokens, spectral_tokens, spectral_tokens)
+            attended = self.cross_norm(attended).transpose(1, 2).reshape_as(rgb_feature)
+            fused[level] = rgb_feature + has_spectral * self.cross_scale * attended
+
+        return (fused, cls_feature) if cls_feature is not None else fused
+
 def build_feature_channel_aligner(in_channels: int, out_channels: int) -> torch.nn.Module:
     if in_channels == out_channels:
         return torch.nn.Identity()
@@ -101,7 +242,7 @@ class FeatureDecoder(torch.nn.Module):
             cls_feat = None
             for module_index, module in enumerate(self.segmentation_model):
                 inputs = module.forward(inputs)
-                if module_index == 0 and isinstance(inputs, tuple):
+                if isinstance(inputs, tuple):
                     inputs, cls_feat = inputs
             if self.cls_head is None:
                 return inputs
@@ -117,7 +258,7 @@ class FeatureDecoder(torch.nn.Module):
                 out = inputs
                 for module_index, module in enumerate(self.segmentation_model[:-1]):
                     out = module(out)
-                    if module_index == 0 and isinstance(out, tuple):
+                    if isinstance(out, tuple):
                         out, _ = out
                 out = self.segmentation_model[-1].predict(out, rescale_to=rescale_to)
         return out
@@ -134,6 +275,9 @@ def build_segmentation_decoder(
     freeze_backbone=True,
     feature_channels: Optional[Dict[str, int]] = None,
     cls_aux_num_classes: int = 0,
+    input_channels: int = 3,
+    fusion_type: str = "input",
+    precomputed_indices: bool = False,
 ):
     backbone_indices_to_use = _get_backbone_out_indices(backbone_model, backbone_out_layers)
     autocast_ctx = partial(torch.autocast, device_type="cuda", enabled=True, dtype=autocast_dtype)
@@ -172,8 +316,25 @@ def build_segmentation_decoder(
             ignore_value=255,
         )
         if cls_aux_num_classes > 0:
-            cls_head = CLSMultiLabelHead(in_dim=embed_dim, num_labels=cls_aux_num_classes)
-        modules = [backbone_model, feature_aligner, decoder]
+            # Adding an auxiliary head must not change subsequent segmentation
+            # parameter initialization for a same-seed on/off comparison.
+            with torch.random.fork_rng(devices=[]):
+                cls_head = CLSMultiLabelHead(in_dim=embed_dim, num_labels=cls_aux_num_classes)
+        modules = []
+        if fusion_type in ("input", "indices"):
+            if input_channels != 3:
+                modules.append(SpectralInputAdapter(
+                    input_channels, add_indices=(fusion_type == "indices"),
+                    precomputed_indices=precomputed_indices,
+                ))
+            modules.append(backbone_model)
+        elif fusion_type in ("late", "gated", "cross_attention"):
+            channels = input_channels - 3 - (2 if precomputed_indices else 0)
+            modules.append(SpectralFeatureFusion(backbone_model, fusion_type, embed_dim, channels,
+                                                improved_fusion=precomputed_indices))
+        else:
+            raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+        modules.extend([feature_aligner, decoder])
     else:
         raise ValueError(
             f'Unsupported decoder "{decoder_type}". This minimal repo only supports "m2f".'

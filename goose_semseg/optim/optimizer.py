@@ -12,10 +12,14 @@ def build_optimizer(
 ) -> AdamW:
     encoder_parameters = []
     other_parameters = []
+    # Select the actual pretrained ViT by object identity, independent of wrapper names.
+    from goose_semseg.models.backbone.adapter import DINOv3_Adapter
+    encoder_ids = {id(p) for module in model.modules() if isinstance(module, DINOv3_Adapter)
+                   for p in module.backbone.parameters()}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if ".backbone." in name or name.startswith("segmentation_model.0.backbone"):
+        if id(parameter) in encoder_ids:
             encoder_parameters.append(parameter)
         else:
             other_parameters.append(parameter)

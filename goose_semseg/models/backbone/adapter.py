@@ -15,6 +15,11 @@ from functools import partial
 from goose_semseg.models.ops.ms_deform_attn import MSDeformAttn
 
 
+def backbone_grad_enabled(freeze_backbone: bool, inputs: torch.Tensor) -> bool:
+    """Replica-safe gradient gate; frozen weights may still pass input gradients."""
+    return torch.is_grad_enabled() and (not freeze_backbone or inputs.requires_grad)
+
+
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     if drop_prob == 0.0 or not training:
         return x
@@ -423,7 +428,11 @@ class DINOv3_Adapter(nn.Module):
         H_toks, W_toks = x.shape[2] // self.patch_size, x.shape[3] // self.patch_size
         bs, C, h, w = x.shape
 
-        backbone_requires_grad = any(param.requires_grad for param in self.backbone.parameters())
+        # DataParallel replicas expose parameter tensors through attributes but
+        # not parameters(); inspecting that iterator incorrectly freezes every
+        # replica. Use the explicit freeze setting, and preserve input gradients
+        # for trainable spectral adapters even with frozen backbone weights.
+        backbone_requires_grad = backbone_grad_enabled(self.freeze_backbone, x)
         with torch.autocast("cuda", torch.bfloat16):
             if backbone_requires_grad:
                 all_layers = self.backbone.get_intermediate_layers(

@@ -42,6 +42,9 @@ def run_epoch(
     cls_aux_num_classes: int,
     cls_aux_pos_weight: Optional[torch.Tensor],
     iter_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    gt_present_only: bool = False,
+    group_confusion_matrices: Optional[Dict[str, torch.Tensor]] = None,
+    cls_aux_fine_to_coarse: Optional[Dict[int, int]] = None,
 ) -> Tuple[float, float, Dict[str, float], Dict[str, float], torch.Tensor]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -53,6 +56,11 @@ def run_epoch(
     cls_correct = 0.0
     cls_count = 0.0
     confusion_matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64, device=device)
+    sample_offset = 0
+    if group_confusion_matrices is not None:
+        from torch.utils.data import SequentialSampler
+        if is_train or not isinstance(loader.sampler, SequentialSampler) or not hasattr(loader.dataset, 'tiles'):
+            raise ValueError('Group diagnostics require sequential, unshuffled source-tile evaluation')
     progress = tqdm(
         loader,
         desc=f"Epoch {epoch + 1}/{epochs} {'train' if is_train else 'val'}",
@@ -90,6 +98,7 @@ def run_epoch(
                         num_classes=num_classes,
                         num_coarse=cls_aux_num_classes,
                         ignore_index=ignore_index,
+                        fine_to_coarse=cls_aux_fine_to_coarse,
                     )
                     if cls_logits.shape[-1] != cls_targets.shape[-1]:
                         raise ValueError(
@@ -115,8 +124,13 @@ def run_epoch(
                     target_size=labels.shape[-2:],
                 )
 
+        if not torch.isfinite(loss.detach()):
+            raise FloatingPointError(f'Non-finite loss at epoch {epoch+1}, step {step}')
+
         if is_train:
-            scaler.scale(loss / grad_accum_steps).backward()
+            accumulation_start = ((step - 1) // grad_accum_steps) * grad_accum_steps
+            accumulation_count = min(grad_accum_steps, len(loader) - accumulation_start)
+            scaler.scale(loss / accumulation_count).backward()
             should_step = (step % grad_accum_steps == 0) or (step == len(loader))
             if should_step:
                 scaler.unscale_(optimizer)
@@ -140,9 +154,18 @@ def run_epoch(
 
         predictions = semantic_scores.argmax(dim=1)
         update_confusion_matrix(confusion_matrix, predictions, labels, num_classes, ignore_index)
+        if group_confusion_matrices is not None:
+            for j in range(len(labels)):
+                record = loader.dataset.records[loader.dataset.tiles[sample_offset+j][0]]
+                for group in (f"sensor/{record['sensor']}", f"task/{record['group']}"):
+                    if group not in group_confusion_matrices:
+                        group_confusion_matrices[group] = torch.zeros_like(confusion_matrix)
+                    update_confusion_matrix(group_confusion_matrices[group], predictions[j], labels[j],
+                                            num_classes, ignore_index)
+            sample_offset += len(labels)
         progress.set_postfix(
             loss=f"{total_loss / max(total_batches, 1):.4f}",
-            miou=f"{compute_mean_iou(confusion_matrix):.4f}",
+            miou=f"{compute_mean_iou(confusion_matrix, gt_present_only):.4f}",
         )
 
     mean_loss = total_loss / max(total_batches, 1)
@@ -152,9 +175,12 @@ def run_epoch(
     cls_metrics = zero_cls_metrics()
     if enable_cls_aux and cls_count > 0.0:
         cls_metrics["cls_aux_accuracy"] = cls_correct / cls_count
+    if group_confusion_matrices is not None:
+        for group in group_confusion_matrices:
+            group_confusion_matrices[group] = group_confusion_matrices[group].detach().cpu()
     return (
         mean_loss,
-        compute_mean_iou(confusion_matrix),
+        compute_mean_iou(confusion_matrix, gt_present_only),
         mean_breakdown,
         cls_metrics,
         confusion_matrix.detach().cpu(),

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torch.nn import functional as F
 from torchvision.transforms import functional as TF
 
 
@@ -33,7 +34,8 @@ def find_goose_samples(root: Path, split: str) -> List[Tuple[Path, Path]]:
     image_root = root / "images" / split
     label_root = root / "labels" / split
     samples: List[Tuple[Path, Path]] = []
-    for image_path in sorted(image_root.glob("*/*.png")):
+    image_paths = list(image_root.glob("*/*.png")) + list(image_root.glob("*/*.npy"))
+    for image_path in sorted(image_paths):
         label_name = _strip_sensor_suffix(image_path.stem) + "_labelids.png"
         label_path = label_root / image_path.parent.name / label_name
         if label_path.exists():
@@ -72,6 +74,7 @@ class GooseSegmentationDataset(Dataset):
         flip_prob: float = 0.0,
         enable_random_crop: bool = False,
         crop_size: Optional[Iterable[int]] = None,
+        input_channels: int = 3,
         enable_rare_class_crop: bool = False,
         rare_class_crop_prob: float = 0.0,
         rare_class_ids: Optional[Iterable[int]] = None,
@@ -86,6 +89,7 @@ class GooseSegmentationDataset(Dataset):
         self.flip_prob = float(flip_prob)
         self.enable_random_crop = bool(enable_random_crop)
         self.crop_size = tuple(crop_size) if crop_size is not None else None
+        self.input_channels = int(input_channels)
         self.enable_rare_class_crop = bool(enable_rare_class_crop)
         self.rare_class_crop_prob = float(rare_class_crop_prob)
         self.rare_class_ids = tuple(sorted({int(class_id) for class_id in (rare_class_ids or [])}))
@@ -122,11 +126,11 @@ class GooseSegmentationDataset(Dataset):
 
         return True
 
-    def _choose_crop_box(self, image: Image.Image, label: Image.Image) -> Tuple[int, int, int, int]:
+    def _choose_crop_box(self, image_size: Tuple[int, int], label: Image.Image) -> Tuple[int, int, int, int]:
         if not self.enable_random_crop or self.crop_size is None:
-            return (0, 0, image.size[0], image.size[1])
+            return (0, 0, image_size[0], image_size[1])
 
-        crop_box = _sample_random_crop_box(image.size, self.crop_size)
+        crop_box = _sample_random_crop_box(image_size, self.crop_size)
         use_rare_crop = (
             self.split == "train"
             and self.enable_rare_class_crop
@@ -138,7 +142,7 @@ class GooseSegmentationDataset(Dataset):
             return crop_box
 
         for _ in range(self.rare_class_crop_attempts):
-            candidate_box = _sample_random_crop_box(image.size, self.crop_size)
+            candidate_box = _sample_random_crop_box(image_size, self.crop_size)
             if self._crop_contains_rare_classes(label, candidate_box):
                 return candidate_box
         return crop_box
@@ -148,23 +152,51 @@ class GooseSegmentationDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         image_path, label_path = self.samples[index]
-        image = Image.open(image_path).convert("RGB")
         label = Image.open(label_path).convert("L")
 
+        if image_path.suffix == ".npy":
+            array = np.load(image_path, allow_pickle=False)
+            if array.ndim != 3 or array.shape[0] != self.input_channels:
+                raise ValueError(
+                    f"Expected {self.input_channels}-channel CHW data, got {array.shape}: {image_path}"
+                )
+            image_tensor = torch.from_numpy(array.astype(np.float32, copy=False)) / 65535.0
+            image = None
+            image_size = (int(array.shape[2]), int(array.shape[1]))
+        else:
+            image = Image.open(image_path).convert("RGB")
+            image_size = image.size
+
         if self.resize_size is not None:
-            image = image.resize(self.resize_size, Image.BILINEAR)
+            if image is None:
+                image_tensor = F.interpolate(
+                    image_tensor[None], size=(self.resize_size[1], self.resize_size[0]),
+                    mode="bilinear", align_corners=False,
+                )[0]
+                image_size = self.resize_size
+            else:
+                image = image.resize(self.resize_size, Image.BILINEAR)
+                image_size = image.size
             label = label.resize(self.resize_size, Image.NEAREST)
 
         if self.split == "train" and self.enable_random_crop and self.crop_size is not None:
-            crop_box = self._choose_crop_box(image, label)
-            image = image.crop(crop_box)
+            crop_box = self._choose_crop_box(image_size, label)
+            if image is None:
+                left, top, right, bottom = crop_box
+                image_tensor = image_tensor[:, top:bottom, left:right]
+            else:
+                image = image.crop(crop_box)
             label = label.crop(crop_box)
 
         if self.split == "train" and self.flip_prob > 0.0 and random.random() < self.flip_prob:
-            image = TF.hflip(image)
+            if image is None:
+                image_tensor = torch.flip(image_tensor, (-1,))
+            else:
+                image = TF.hflip(image)
             label = TF.hflip(label)
 
-        image_tensor = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1).float() / 255.0
-        image_tensor = (image_tensor - IMAGENET_MEAN) / IMAGENET_STD
+        if image is not None:
+            image_tensor = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1).float() / 255.0
+            image_tensor = (image_tensor - IMAGENET_MEAN) / IMAGENET_STD
         label_tensor = torch.from_numpy(np.array(label, copy=True)).long()
         return image_tensor, label_tensor

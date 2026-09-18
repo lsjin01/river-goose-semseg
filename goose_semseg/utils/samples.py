@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,9 +25,17 @@ def _resolve_cls_aux_output_dim(
     *,
     target_type: str,
     num_classes: int,
+    taxonomy: str = 'legacy',
 ) -> int:
     target_type = str(target_type).lower()
     if target_type == "coarse":
+        if taxonomy == 'labeling_data':
+            from goose_semseg.data.labeling_taxonomy import COARSE_NAMES, FINE_NAMES
+            if num_classes != len(FINE_NAMES):
+                raise ValueError('labeling_data coarse auxiliary requires 11 fine classes')
+            return len(COARSE_NAMES)
+        if taxonomy != 'legacy':
+            raise ValueError(f'Unknown CLS taxonomy: {taxonomy}')
         return CLS_AUX_COARSE_NUM_CLASSES
     if target_type == "fine":
         return int(num_classes)
@@ -42,6 +50,7 @@ def _compute_cls_aux_pos_weight_from_samples(
     cls_aux_num_classes: int,
     ignore_index: int,
     max_pos_weight: float,
+    fine_to_coarse: Optional[Dict[int, int]] = None,
 ) -> torch.Tensor:
     positive_counts = torch.zeros(cls_aux_num_classes, dtype=torch.float64)
     total_samples = 0
@@ -55,6 +64,7 @@ def _compute_cls_aux_pos_weight_from_samples(
             num_classes=num_classes,
             num_coarse=cls_aux_num_classes,
             ignore_index=ignore_index,
+            fine_to_coarse=fine_to_coarse,
         )[0].to(dtype=torch.float64)
         positive_counts += target
         total_samples += 1

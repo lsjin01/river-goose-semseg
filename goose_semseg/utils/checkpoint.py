@@ -44,14 +44,21 @@ def save_checkpoint(
     best_val_miou: float,
     args: argparse.Namespace,
 ) -> None:
+    checkpoint_model = model.module if isinstance(model, nn.DataParallel) else model
     payload = {
         "epoch": epoch,
         "best_val_miou": best_val_miou,
-        "model_state_dict": model.state_dict(),
+        # Keep checkpoints portable between single-GPU and DataParallel runs.
+        "model_state_dict": checkpoint_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "args": vars(args),
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
-    torch.save(payload, path)
+    # A training process may be interrupted while a multi-gigabyte checkpoint
+    # is being written.  Write beside the destination and publish atomically so
+    # the previous valid checkpoint is never replaced by a partial file.
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)

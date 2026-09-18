@@ -23,11 +23,11 @@ def update_confusion_matrix(
     )
 
 
-def compute_mean_iou(confusion_matrix: torch.Tensor) -> float:
+def compute_mean_iou(confusion_matrix: torch.Tensor, gt_present_only: bool = False) -> float:
     matrix = confusion_matrix.float()
     intersection = torch.diag(matrix)
     union = matrix.sum(dim=1) + matrix.sum(dim=0) - intersection
-    valid = union > 0
+    valid = matrix.sum(dim=1) > 0 if gt_present_only else union > 0
     if not torch.any(valid):
         return 0.0
     return float((intersection[valid] / union[valid].clamp_min(1)).mean().item())

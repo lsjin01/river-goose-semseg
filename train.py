@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=None,
+        help="Validation batch size; defaults to --batch_size.",
+    )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=1)
     parser.add_argument("--lr", type=float, default=4e-5)
@@ -109,8 +115,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--data_parallel",
+        action="store_true",
+        help="Use all CUDA devices visible to this process via torch.nn.DataParallel.",
+    )
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--flip_prob", type=float, default=0.0)
+    parser.add_argument("--input_channels", type=int, default=3)
+    parser.add_argument("--source_tiles", action="store_true")
+    parser.add_argument(
+        "--segmentation_taxonomy",
+        choices=['source', 'binary_algae', 'merged_algae_7class'],
+        default='source',
+    )
+    parser.add_argument("--tile_size", type=int, default=768)
+    parser.add_argument("--class_sampling_prob", type=float, default=0.7)
+    parser.add_argument("--class_sampling_mode", choices=['global', 'within_image'], default='global')
+    parser.add_argument("--val_group_metrics", action='store_true')
+    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument(
+        "--fusion_type",
+        choices=["input", "indices", "late", "gated", "cross_attention"],
+        default="input",
+    )
     parser.add_argument("--enable_random_crop", action="store_true")
     parser.add_argument("--crop_width", type=int, default=1024)
     parser.add_argument("--crop_height", type=int, default=1024)
@@ -154,12 +182,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_from", default=None)
     parser.add_argument("--resume_from", default=None)
     parser.add_argument("--enable_cls_aux", action="store_true")
+    parser.add_argument("--cls_aux_taxonomy", choices=['legacy', 'labeling_data'], default='legacy',
+                        help='Coarse hierarchy: legacy AIHub (3) or new Labeling_Data (7).')
     parser.add_argument(
         "--cls_aux_target_type",
         choices=["coarse", "fine"],
         default="coarse",
-        help="CLS auxiliary multi-hot target type. 'coarse' uses 11-way coarse groups; 'fine' uses fine classes.",
+        help="CLS auxiliary multi-hot target: taxonomy-specific coarse groups or fine classes.",
     )
+    parser.add_argument("--max_best_checkpoints", type=int, default=0)
     parser.add_argument(
         "--cls_aux_num_classes",
         type=int,
@@ -200,11 +231,32 @@ def main() -> None:
         args.run_name = "goose_dinov3_vitl16_m2f_ce_1024"
     if args.init_from and args.resume_from:
         raise ValueError("Use either --init_from or --resume_from, not both.")
+    if args.segmentation_taxonomy == 'binary_algae':
+        if not args.source_tiles or args.num_classes != 2 or args.ignore_index != 255:
+            raise ValueError('binary_algae requires source_tiles, num_classes=2, ignore_index=255')
+        if args.enable_cls_aux and args.cls_aux_target_type != 'fine':
+            raise ValueError('binary_algae CLS auxiliary must use the two remapped fine targets')
+    if args.segmentation_taxonomy == 'merged_algae_7class':
+        if not args.source_tiles or args.num_classes != 7 or args.ignore_index != 255:
+            raise ValueError('merged_algae_7class requires source_tiles, num_classes=7, ignore_index=255')
+        if args.enable_cls_aux and args.cls_aux_target_type != 'fine':
+            raise ValueError('merged_algae_7class CLS auxiliary must use fine targets')
     args.cls_aux_target_type = str(args.cls_aux_target_type).lower()
     args.cls_aux_num_classes = _resolve_cls_aux_output_dim(
         target_type=args.cls_aux_target_type,
         num_classes=args.num_classes,
+        taxonomy=args.cls_aux_taxonomy,
     )
+    cls_aux_fine_to_coarse = None
+    if args.enable_cls_aux and args.cls_aux_target_type == 'coarse' and args.cls_aux_taxonomy == 'labeling_data':
+        from goose_semseg.data.labeling_taxonomy import fine_to_coarse_mapping
+        cls_aux_fine_to_coarse = fine_to_coarse_mapping()
+    if args.source_tiles and args.enable_cls_aux:
+        if args.cls_aux_target_type == 'coarse' and args.cls_aux_taxonomy != 'labeling_data':
+            raise ValueError('source_tiles coarse auxiliary requires --cls_aux_taxonomy labeling_data')
+        if args.cls_aux_loss_type == 'weighted_bce':
+            raise ValueError('source_tiles auxiliary currently supports bce only; '
+                             'image-presence weights do not represent sampled crops')
     seed_everything(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -216,26 +268,65 @@ def main() -> None:
         json.dump(vars(args), fp, indent=2)
 
     resize_size = (args.resize_width, args.resize_height)
-    train_dataset = GooseSegmentationDataset(
-        args.data_path,
-        "train",
-        resize_size=resize_size,
-        flip_prob=args.flip_prob,
-        enable_random_crop=args.enable_random_crop,
-        crop_size=(args.crop_width, args.crop_height),
-        enable_rare_class_crop=args.enable_rare_class_crop,
-        rare_class_crop_prob=args.rare_class_crop_prob,
-        rare_class_ids=args.rare_class_ids,
-        rare_class_min_pixels=args.rare_class_min_pixels,
-        rare_class_min_ratio=args.rare_class_min_ratio,
-        rare_class_crop_attempts=args.rare_class_crop_attempts,
-    )
-    val_dataset = GooseSegmentationDataset(
-        args.data_path,
-        "val",
-        resize_size=resize_size,
-        flip_prob=0.0,
-    )  # Data Loader
+    if args.source_tiles:
+        from goose_semseg.data.spectral_tiles import SpectralTileDataset
+        dataset_class = SpectralTileDataset
+        if args.segmentation_taxonomy == 'binary_algae':
+            from goose_semseg.data.binary_algae import BinaryAlgaeTileDataset, binary_taxonomy_metadata
+            dataset_class = BinaryAlgaeTileDataset
+            (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(binary_taxonomy_metadata(), indent=2))
+        if args.input_channels != 9:
+            raise ValueError('source_tiles requires input_channels=9')
+        train_dataset = dataset_class(args.data_path, 'train', args.tile_size,
+                                           args.flip_prob, args.class_sampling_prob,
+                                           args.class_sampling_mode)
+        val_dataset = dataset_class(args.data_path, 'val', args.tile_size)
+        if args.segmentation_taxonomy == 'binary_algae' and train_dataset.native_binary:
+            (run_dir/'segmentation_taxonomy.json').write_text(json.dumps(dict(
+                name='binary_algae',class_names=train_dataset.manifest['class_names'],
+                annotation_label_key='label_id',ignore_index=255,source_annotations_unchanged=True,
+                **train_dataset.manifest['taxonomy']),indent=2))
+        if args.segmentation_taxonomy == 'merged_algae_7class':
+            from goose_semseg.data.merged_algae import CLASS_NAMES, taxonomy_metadata
+            if train_dataset.manifest.get('annotation_label_key') != 'label_id':
+                raise ValueError('merged_algae_7class requires a native label_id manifest')
+            if train_dataset.manifest['class_names'] != list(CLASS_NAMES):
+                raise ValueError('merged_algae_7class manifest class order does not match the model')
+            (run_dir/'segmentation_taxonomy.json').write_text(
+                json.dumps(taxonomy_metadata(), indent=2)
+            )
+        if cls_aux_fine_to_coarse is not None:
+            from goose_semseg.data.labeling_taxonomy import COARSE_NAMES, fine_to_coarse_mapping
+            cls_aux_fine_to_coarse = fine_to_coarse_mapping(train_dataset.manifest['class_names'])
+            (run_dir/'cls_aux_taxonomy.json').write_text(json.dumps(dict(
+                fine_names=train_dataset.manifest['class_names'], coarse_names=COARSE_NAMES,
+                fine_to_coarse=cls_aux_fine_to_coarse), indent=2))
+        import hashlib
+        manifest_bytes = (Path(args.data_path)/'manifest.json').read_bytes()
+        (run_dir/'dataset_manifest_sha256.txt').write_text(hashlib.sha256(manifest_bytes).hexdigest())
+    else:
+        train_dataset = GooseSegmentationDataset(
+            args.data_path,
+            "train",
+            resize_size=resize_size,
+            flip_prob=args.flip_prob,
+            enable_random_crop=args.enable_random_crop,
+            crop_size=(args.crop_width, args.crop_height),
+            enable_rare_class_crop=args.enable_rare_class_crop,
+            rare_class_crop_prob=args.rare_class_crop_prob,
+            rare_class_ids=args.rare_class_ids,
+            rare_class_min_pixels=args.rare_class_min_pixels,
+            rare_class_min_ratio=args.rare_class_min_ratio,
+            input_channels=args.input_channels,
+            rare_class_crop_attempts=args.rare_class_crop_attempts,
+        )
+        val_dataset = GooseSegmentationDataset(
+            args.data_path,
+            "val",
+            resize_size=resize_size,
+            flip_prob=0.0,
+            input_channels=args.input_channels,
+        )
     print(f"Loaded {len(train_dataset)} train samples and {len(val_dataset)} val samples.")
 
     loader_kwargs = {
@@ -250,13 +341,15 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
+        generator=torch.Generator().manual_seed(args.seed),
         **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=(args.val_batch_size or args.batch_size),
         shuffle=False,
         drop_last=False,
+        generator=torch.Generator().manual_seed(args.seed + 1),
         **loader_kwargs,
     )
 
@@ -286,7 +379,10 @@ def main() -> None:
         autocast_dtype=torch.bfloat16,
         freeze_backbone=args.freeze_backbone,
         feature_channels=feature_channels,
+        input_channels=args.input_channels,
         cls_aux_num_classes=(args.cls_aux_num_classes if args.enable_cls_aux else 0),
+        fusion_type=args.fusion_type,
+        precomputed_indices=args.source_tiles,
     ).to(device)
     if args.enable_cls_aux:
         print(
@@ -382,6 +478,7 @@ def main() -> None:
             cls_aux_num_classes=args.cls_aux_num_classes,
             ignore_index=args.ignore_index,
             max_pos_weight=args.cls_aux_pos_weight_max,
+            fine_to_coarse=cls_aux_fine_to_coarse,
         )
         preview_count = min(8, cls_aux_pos_weight.numel())
         preview = ", ".join(f"{float(value):.2f}" for value in cls_aux_pos_weight[:preview_count])
@@ -433,9 +530,31 @@ def main() -> None:
         best_val_miou = float(checkpoint.get("best_val_miou", best_val_miou))
         print(f"Resumed from {args.resume_from} at epoch {start_epoch}.")
 
+    if args.data_parallel:
+        visible_device_count = torch.cuda.device_count()
+        if visible_device_count < 2:
+            raise RuntimeError(
+                "--data_parallel requires at least two visible CUDA devices; "
+                f"found {visible_device_count}."
+            )
+        model = torch.nn.DataParallel(model)
+        print(f"DataParallel enabled across {visible_device_count} CUDA devices.")
+
     epochs_without_improvement = 0
+    if args.resume_from:
+        import csv
+        metrics_file = run_dir/'epoch_metrics.csv'
+        if metrics_file.exists():
+            history = list(csv.DictReader(metrics_file.open()))
+            previous_best, last_improved = float('-inf'), 0
+            for row in history:
+                if int(row['epoch']) > start_epoch:
+                    continue
+                if float(row['val_miou']) > previous_best + args.early_stopping_min_delta:
+                    previous_best, last_improved = float(row['val_miou']), int(row['epoch'])
+            epochs_without_improvement = sum(last_improved < int(row['epoch']) <= start_epoch for row in history)
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_miou, train_breakdown, train_cls_metrics, _ = run_epoch(
+        train_loss, train_miou, train_breakdown, train_cls_metrics, train_confusion_matrix = run_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -455,8 +574,26 @@ def main() -> None:
             cls_aux_weight=args.cls_aux_weight,
             cls_aux_num_classes=args.cls_aux_num_classes,
             cls_aux_pos_weight=cls_aux_pos_weight,
+            cls_aux_fine_to_coarse=cls_aux_fine_to_coarse,
             iter_scheduler=scheduler,
+            gt_present_only=args.source_tiles,
         )
+        if args.val_group_metrics:
+            append_per_class_metrics(run_dir/'train_per_class_metrics.csv', epoch, train_confusion_matrix)
+        if (epoch + 1) % max(1, args.val_interval) != 0 and epoch + 1 != args.epochs:
+            print(f'epoch={epoch+1} train_loss={train_loss:.4f} train_miou={train_miou:.4f} validation=scheduled')
+            progress = dict(epoch=epoch+1, train_loss=train_loss, train_miou=train_miou,
+                            best_val_miou=best_val_miou)
+            if args.enable_cls_aux:
+                progress.update(train_cls_aux_loss=train_breakdown['loss_cls_aux'],
+                                train_cls_aux_accuracy=train_cls_metrics['cls_aux_accuracy'])
+                print(f"  train_cls_aux_loss={train_breakdown['loss_cls_aux']:.6f} "
+                      f"train_cls_aux_acc={train_cls_metrics['cls_aux_accuracy']:.4f}")
+            (run_dir/'progress.json').write_text(json.dumps(progress))
+            save_checkpoint(run_dir/'latest.pt',model=model,optimizer=optimizer,scaler=scaler,
+                scheduler=scheduler,epoch=epoch,best_val_miou=best_val_miou,args=args)
+            continue
+        val_groups = {} if args.val_group_metrics and args.source_tiles else None
         val_loss, val_miou, val_breakdown, val_cls_metrics, val_confusion_matrix = run_epoch(
             model=model,
             loader=val_loader,
@@ -477,7 +614,29 @@ def main() -> None:
             cls_aux_weight=args.cls_aux_weight,
             cls_aux_num_classes=args.cls_aux_num_classes,
             cls_aux_pos_weight=cls_aux_pos_weight,
+            cls_aux_fine_to_coarse=cls_aux_fine_to_coarse,
+            gt_present_only=args.source_tiles,
+            group_confusion_matrices=val_groups,
         )
+
+        if val_groups is not None:
+            from goose_semseg.utils.metrics import compute_mean_iou, per_class_metric_rows
+            val_groups['overall'] = val_confusion_matrix
+            grouped = {}
+            for name, matrix in val_groups.items():
+                rows = per_class_metric_rows(matrix, epoch)
+                for row in rows:
+                    row['class_name'] = val_dataset.manifest['class_names'][row['class_id']]
+                    for key, value in row.items():
+                        if isinstance(value, float) and not math.isfinite(value):
+                            row[key] = None
+                grouped[name] = dict(miou=compute_mean_iou(matrix, gt_present_only=True),
+                    supported_class_ids=torch.where(matrix.sum(1)>0)[0].tolist(),
+                    confusion_matrix=matrix.tolist(), per_class=rows)
+            (run_dir/f'val_groups_epoch_{epoch+1:03d}.json').write_text(json.dumps(dict(
+                epoch=epoch+1, tta=False, metrics=grouped,
+                metric_definition='Each group averages its GT-supported classes; compare identical groups across runs.'
+            ), indent=2, allow_nan=False))
 
         log_message = (
             f"epoch={epoch + 1} train_loss={train_loss:.4f} train_miou={train_miou:.4f} "
@@ -497,8 +656,9 @@ def main() -> None:
         if improved:
             best_val_miou = val_miou
             epochs_without_improvement = 0
+            best_checkpoint_path = run_dir / f"best_epoch_{epoch + 1:03d}_miou_{val_miou:.4f}.pt"
             save_checkpoint(
-                run_dir / f"best_epoch_{epoch + 1:03d}_miou_{val_miou:.4f}.pt",
+                best_checkpoint_path,
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -507,6 +667,12 @@ def main() -> None:
                 best_val_miou=best_val_miou,
                 args=args,
             )
+            if args.max_best_checkpoints > 0:
+                previous_best = sorted(
+                    path for path in run_dir.glob("best_epoch_*.pt") if path != best_checkpoint_path
+                )
+                for obsolete in previous_best[:max(0, len(previous_best) - args.max_best_checkpoints + 1)]:
+                    obsolete.unlink()
         else:
             epochs_without_improvement += 1
 
@@ -543,12 +709,23 @@ def main() -> None:
             epoch,
             val_confusion_matrix,
         )
+        if args.source_tiles:
+            (run_dir/'progress.json').write_text(json.dumps(dict(epoch=epoch+1,
+                train_loss=train_loss, train_miou=train_miou, val_loss=val_loss,
+                val_miou=val_miou, best_val_miou=best_val_miou)))
 
         if epochs_without_improvement >= args.early_stopping_patience:
             print(f"Early stopping after {epochs_without_improvement} epochs without mIoU improvement.")
             break
 
     print(f"Done. Best val mIoU: {best_val_miou:.4f}. Output: {run_dir}")
+    if args.source_tiles:
+        if not math.isfinite(best_val_miou):
+            raise RuntimeError('Training ended without a finite validation result')
+        (run_dir/'training_complete.json').write_text(json.dumps({
+            'best_val_miou':best_val_miou, 'status':'completed',
+            'manifest_sha256':(run_dir/'dataset_manifest_sha256.txt').read_text(),
+        }, indent=2))
 
 
 if __name__ == "__main__":
