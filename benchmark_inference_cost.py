@@ -84,13 +84,18 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
         args.teacher_checkpoint = teacher_checkpoint
         return load_teacher(args, device)
 
+    checkpoint = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else None
+    saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     model = build_student(
         args.student_model,
         args.num_classes,
         local_files_only=args.student_local_files_only,
+        input_channels=int(saved_args.get("input_channels", 3)),
+        precomputed_indices=bool(saved_args.get("precomputed_indices", False)),
     )
-    if args.checkpoint:
-        load_student_checkpoint(model, args.checkpoint)
+    if checkpoint is not None:
+        state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
+        model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
     return model

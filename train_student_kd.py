@@ -103,6 +103,17 @@ def load_factory(factory: str):
 
 
 def build_dataset(split: str, args: argparse.Namespace) -> Dataset:
+    if getattr(args, "source_tiles", False):
+        from goose_semseg.data.spectral_tiles import SpectralTileDataset
+
+        return SpectralTileDataset(
+            args.data_path,
+            split,
+            tile_size=args.tile_size,
+            flip_prob=(args.flip_prob if split == "train" else 0.0),
+            rare_prob=(args.class_sampling_prob if split == "train" else 0.0),
+            class_sampling_mode=args.class_sampling_mode,
+        )
     if args.dataset_factory:
         factory = load_factory(args.dataset_factory)
         return factory(split=split, args=args)
@@ -145,7 +156,43 @@ def build_dataset(split: str, args: argparse.Namespace) -> Dataset:
     return SegmentationFolderDataset(image_dir, mask_dir, image_size=args.image_size)
 
 
-def build_student(student_model: str, num_classes: int, local_files_only: bool) -> nn.Module:
+class SpectralSegformerStudent(nn.Module):
+    """Keep the RGB-pretrained SegFormer intact behind a learned spectral adapter."""
+
+    def __init__(self, segformer: nn.Module, input_channels: int, precomputed_indices: bool):
+        super().__init__()
+        from goose_semseg.models.builder import SpectralInputAdapter
+
+        self.input_adapter = SpectralInputAdapter(
+            input_channels,
+            add_indices=False,
+            precomputed_indices=precomputed_indices,
+        )
+        self.segformer = segformer
+
+    def forward(self, pixel_values: torch.Tensor):
+        return self.segformer(pixel_values=self.input_adapter(pixel_values))
+
+
+def _local_hf_snapshot(model_id: str) -> Optional[str]:
+    cache = Path.home() / ".cache" / "huggingface" / "hub" / (
+        "models--" + model_id.replace("/", "--")
+    )
+    ref = cache / "refs" / "main"
+    if ref.is_file():
+        snapshot = cache / "snapshots" / ref.read_text().strip()
+        if (snapshot / "config.json").is_file():
+            return str(snapshot)
+    return None
+
+
+def build_student(
+    student_model: str,
+    num_classes: int,
+    local_files_only: bool,
+    input_channels: int = 3,
+    precomputed_indices: bool = False,
+) -> nn.Module:
     try:
         from transformers import SegformerForSemanticSegmentation
     except ImportError as exc:
@@ -154,12 +201,26 @@ def build_student(student_model: str, num_classes: int, local_files_only: bool) 
         ) from exc
 
     checkpoint = STUDENT_CHECKPOINTS[student_model]
-    return SegformerForSemanticSegmentation.from_pretrained(
-        checkpoint,
-        num_labels=num_classes,
-        ignore_mismatched_sizes=True,
-        local_files_only=local_files_only,
-    )
+    try:
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            checkpoint,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True,
+            local_files_only=local_files_only,
+        )
+    except OSError:
+        snapshot = _local_hf_snapshot(checkpoint) if local_files_only else None
+        if snapshot is None:
+            raise
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            snapshot,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True,
+            local_files_only=True,
+        )
+    if input_channels != 3:
+        return SpectralSegformerStudent(model, input_channels, precomputed_indices)
+    return model
 
 
 def _namespace_with_fallback(primary: Dict[str, Any], fallback: argparse.Namespace) -> argparse.Namespace:
@@ -203,6 +264,9 @@ def load_goose_teacher(args: argparse.Namespace, device: torch.device) -> nn.Mod
         cls_aux_num_classes=(
             teacher_args.cls_aux_num_classes if getattr(teacher_args, "enable_cls_aux", False) else 0
         ),
+        input_channels=getattr(teacher_args, "input_channels", 3),
+        fusion_type=getattr(teacher_args, "fusion_type", "input"),
+        precomputed_indices=getattr(teacher_args, "source_tiles", False),
     )
     missing_keys, unexpected_keys, _ = load_model_state_allowing_token_specialization(
         teacher,
@@ -314,16 +378,20 @@ def kd_loss(
     temperature: float,
     enable_confidence_kd: bool,
     teacher_conf_threshold: float,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
     per_class_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none")
     per_pixel_kl = per_class_kl.sum(dim=1)
 
+    if valid_mask is None:
+        valid_mask = torch.ones_like(per_pixel_kl, dtype=torch.bool)
+
     if not enable_confidence_kd:
-        return per_pixel_kl.mean() * (temperature**2)
+        return per_pixel_kl[valid_mask].mean() * (temperature**2)
 
     teacher_conf = teacher_probs.max(dim=1).values
-    weights = teacher_conf
+    weights = teacher_conf * valid_mask.to(teacher_conf.dtype)
     if teacher_conf_threshold > 0:
         weights = weights * (teacher_conf >= teacher_conf_threshold).float()
     denom = weights.sum().clamp_min(1.0)
