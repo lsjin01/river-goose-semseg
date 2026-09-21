@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -19,19 +20,36 @@ def load_model_state_allowing_token_specialization(
     adapted_state_dict: Dict[str, torch.Tensor] = {}
     used_source_keys = set()
 
+    # A multispectral input adapter is inserted at segmentation_model.0 while an
+    # RGB checkpoint starts directly with the backbone at index 0.  Detect that
+    # one-module layout shift so RGB domain-pretrained backbone/decoder weights
+    # are not silently discarded during spectral fine-tuning.
+    target_has_input_adapter = "segmentation_model.0.rgb_projection.weight" in target_state_dict
+    source_has_input_adapter = "segmentation_model.0.rgb_projection.weight" in source_state_dict
+    shift_rgb_source = target_has_input_adapter and not source_has_input_adapter
+    remapped_count = 0
+
     for target_key, target_value in target_state_dict.items():
-        source_value = source_state_dict.get(target_key)
+        source_key = target_key
+        if shift_rgb_source:
+            match = re.match(r"^segmentation_model\.(\d+)\.(.+)$", target_key)
+            if match and int(match.group(1)) > 0:
+                source_key = "segmentation_model.{}.{}".format(
+                    int(match.group(1)) - 1, match.group(2)
+                )
+        source_value = source_state_dict.get(source_key)
         if source_value is None:
             continue
         if source_value.shape != target_value.shape:
             continue
         adapted_state_dict[target_key] = source_value
-        used_source_keys.add(target_key)
+        used_source_keys.add(source_key)
+        remapped_count += int(source_key != target_key)
 
     load_result = model.load_state_dict(adapted_state_dict, strict=False)
     missing_keys = list(load_result.missing_keys)
     unexpected_keys = sorted(set(source_state_dict) - used_source_keys)
-    return missing_keys, unexpected_keys, 0
+    return missing_keys, unexpected_keys, remapped_count
 
 
 def save_checkpoint(

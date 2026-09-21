@@ -290,6 +290,9 @@ checkpoint를 선택하는 최신 설정은
 동일한 9채널 입력을 SegFormer-B1/B0에 증류하는 방법과 실행 큐는
 [7-class multispectral SegFormer KD](docs/merged_algae_7class_kd.md)를 참고하십시오.
 
+여러 강에서 학습한 DINOv3+Mask2Former teacher를 확장 Labeling_Data에 이전하는
+후속 실험은 [multi-river teacher fine-tuning](docs/multiriver_labeling_finetune.md)을 참고하십시오.
+
 - 실험 설정은 `config/` 또는 각 실행의 `train_args.json`으로 관리합니다.
 - 학습 데이터와 체크포인트는 Git 대신 외부 스토리지나 Git LFS로 관리하십시오.
 - 공개 전 데이터 라이선스와 개인정보 포함 여부를 반드시 확인하십시오.

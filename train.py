@@ -454,10 +454,14 @@ def main() -> None:
         initialize_head_from_pretrained(model, pretrained_mask2former)
     if args.init_from:
         checkpoint = torch.load(args.init_from, map_location=device)
-        missing_keys, unexpected_keys, _ = load_model_state_allowing_token_specialization(
+        missing_keys, unexpected_keys, remapped_keys = load_model_state_allowing_token_specialization(
             model,
             checkpoint["model_state_dict"],
         )
+        if remapped_keys:
+            print(
+                f"Remapped {remapped_keys} tensors after inserting the spectral input adapter."
+            )
         if missing_keys:
             print(
                 "Warning: init_from left {} model tensors initialized from the "
