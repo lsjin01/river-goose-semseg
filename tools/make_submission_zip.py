@@ -1,4 +1,4 @@
-#!/opt/conda/envs/goose/bin/python
+#!/usr/bin/env python3
 """
 Create a Codabench submission zip from a DINOv3+Mask2Former training
 checkpoint (.pt), end-to-end.

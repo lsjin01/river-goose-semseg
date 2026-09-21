@@ -1,4 +1,4 @@
-#!/opt/conda/envs/goose/bin/python
+#!/usr/bin/env python3
 """Competition-style fine + coarse mIoU evaluation for DINOv3+M2F checkpoints.
 
 Slim port of the original goose-semseg-challenge evaluation.py that drops

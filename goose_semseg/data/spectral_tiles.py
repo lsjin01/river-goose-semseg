@@ -5,6 +5,7 @@ P1 occupies B/G/R slots only; unavailable spectral/ratio slots stay zero.
 Validation/test tiles never overlap and padded pixels are ignored.
 """
 import json
+import os
 import random
 from functools import lru_cache
 from pathlib import Path
@@ -15,12 +16,38 @@ from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 
 
+def resolve_manifest_source(root: Path, source_value: str) -> Path:
+    """Resolve raw data after a manifest/repository has moved to another machine."""
+    root = root.expanduser().resolve()
+    recorded = Path(source_value).expanduser()
+    override = os.environ.get('RIVER_SEMSEG_SOURCE_ROOT')
+    candidates = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    if recorded.is_absolute():
+        candidates.append(recorded)
+        # Old manifests recorded a workstation-specific absolute path. Preserve
+        # the basename and try the same repository layout on the new machine.
+        candidates.extend((root.parents[1] / recorded.name, root.parent / recorded.name))
+    else:
+        candidates.extend((root / recorded, root.parents[1] / recorded))
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_dir():
+            return candidate
+    attempted = ', '.join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        f'Raw source dataset not found. Tried: {attempted}. '
+        'Set RIVER_SEMSEG_SOURCE_ROOT to the copied Labeling_Data directory.'
+    )
+
+
 class SpectralTileDataset(Dataset):
     def __init__(self, root, split, tile_size=768, flip_prob=0.5, rare_prob=0.7,
                  class_sampling_mode='global'):
         self.root = Path(root)
         self.manifest = json.loads((self.root/'manifest.json').read_text())
-        self.source = Path(self.manifest['source'])
+        self.source = resolve_manifest_source(self.root, self.manifest['source'])
         self.records = [r for r in self.manifest['records'] if r['split']==split]
         self.split, self.tile_size = split, int(tile_size)
         self.flip_prob, self.rare_prob = flip_prob, rare_prob

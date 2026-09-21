@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -164,7 +165,8 @@ def main():
         scale=np.maximum(high-low,np.maximum(a.std(1),1))
         statistics[sensor]=dict(low=low.tolist(),scale=scale.tolist(),mean=a.mean(1).tolist(),
                                 std=a.std(1).tolist(),sample_count=int(a.shape[1]))
-    manifest=dict(source=str(source),version='binary_labeling_v2',seed=42,
+    portable_source=os.path.relpath(source, start=out.resolve())
+    manifest=dict(source=portable_source,version='binary_labeling_v2',seed=42,
         class_names=NAMES,annotation_label_key='label_id',normalization=statistics,records=records,
         taxonomy=dict(positive_names=sorted(POSITIVE),negative_names=sorted(NEGATIVE),ignore_names=['ambiguous']),
         audit=dict(splits=split_counts,geographic_links=links,geographic_merge_distance_m=1000,

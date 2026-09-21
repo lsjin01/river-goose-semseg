@@ -11,8 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path("/opt/conda/envs/goose/bin/python")
-TEACHER = ROOT / "outputs/labeling_merged_algae_7class_v3_gpu1/merged_algae7_gpu1_overlap_seed42/best_epoch_075_miou_0.6207.pt"
+PYTHON = Path(sys.executable)
+TEACHER = Path(os.environ.get(
+    "RIVER_SEMSEG_TEACHER_CHECKPOINT",
+    ROOT / "outputs/labeling_merged_algae_7class_v3_gpu1/merged_algae7_gpu1_overlap_seed42/best_epoch_075_miou_0.6207.pt",
+)).expanduser()
+if not TEACHER.is_absolute():
+    TEACHER = ROOT / TEACHER
 TEST_RESULT = TEACHER.parent / "test_overlap_stride512.json"
 QUEUE_ROOT = ROOT / "outputs/labeling_merged_algae_7class_kd"
 STATE = QUEUE_ROOT / "queue_state.json"
@@ -72,8 +77,8 @@ def train(model: str) -> None:
 
 
 def main() -> None:
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
-        raise RuntimeError("This pinned queue must run with CUDA_VISIBLE_DEVICES=1")
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        raise RuntimeError("Set CUDA_VISIBLE_DEVICES to the one physical GPU used by this queue")
     if not TEACHER.is_file():
         raise FileNotFoundError(TEACHER)
     wait_for_test()

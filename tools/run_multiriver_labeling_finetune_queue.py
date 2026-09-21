@@ -6,15 +6,21 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path("/opt/conda/envs/goose/bin/python")
+PYTHON = Path(sys.executable)
 UPSTREAM_STATE = ROOT / "outputs/labeling_merged_algae_7class_kd/queue_state.json"
 CONFIG = ROOT / "config/labeling_merged_algae_7class_multiriver_ft_gpu1.yaml"
-SOURCE = ROOT / "outputs_old/baseline_100ep/baseline_cat2_100ep/best.pt"
+SOURCE = Path(os.environ.get(
+    "MULTIRIVER_TEACHER_CHECKPOINT",
+    ROOT / "outputs_old/baseline_100ep/baseline_cat2_100ep/best.pt",
+)).expanduser()
+if not SOURCE.is_absolute():
+    SOURCE = ROOT / SOURCE
 MANIFEST = ROOT / "data/labeling_merged_algae_7class_v2_geo/manifest.json"
 OUTPUT_ROOT = ROOT / "outputs/labeling_merged_algae_7class_multiriver_ft_gpu1"
 RUN_DIR = OUTPUT_ROOT / "merged_algae7_multiriver_ft_seed42"
@@ -43,8 +49,8 @@ def wait_for_upstream() -> None:
 
 
 def main() -> None:
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
-        raise RuntimeError("This pinned queue must run with CUDA_VISIBLE_DEVICES=1")
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        raise RuntimeError("Set CUDA_VISIBLE_DEVICES to the one physical GPU used by this queue")
     for required in (CONFIG, SOURCE, MANIFEST):
         if not required.is_file():
             raise FileNotFoundError(required)

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -190,7 +191,8 @@ def main():
             assert not {root(r['group']) for r in a} & {root(r['group']) for r in b}
             assert not {r['sha256'] for r in a} & {r['sha256'] for r in b}
     out.mkdir(parents=True)
-    manifest = dict(source=str(source), version=2, seed=42, normalization=statistics,
+    portable_source = os.path.relpath(source, start=out.resolve())
+    manifest = dict(source=portable_source, version=2, seed=42, normalization=statistics,
                     class_names=['land','bridge','other','nps','algae0','algae1','algae2','algae3','algae4','turbid','nps_algae'],
                     records=records, audit=report)
     (out/'manifest.json').write_text(json.dumps(manifest, indent=2))
