@@ -49,6 +49,12 @@ cd ../../../..
 [다른 서버 실행 가이드](docs/portability.md)를 참고하십시오. 데이터와 체크포인트는
 Git에 포함되지 않으므로 코드만 clone해서는 실제 학습을 시작할 수 없습니다.
 
+현재 워크스테이션에서 검증한 정확한 패키지 버전은 `requirements-validated.txt`,
+Conda 환경 구성은 `environment.yml`에 기록되어 있습니다. 완료된 Labeling_Data_v2
+Teacher/B1/B0 전달용 묶음의 설명은
+[`artifacts/labeling_data_v2_7class_models`](artifacts/labeling_data_v2_7class_models/)에
+있습니다.
+
 ## 학습 데이터 준비
 
 이 프로젝트가 학습하는 대상은 **하천 오염 데이터**입니다. 코드와 일부 경로에 남아

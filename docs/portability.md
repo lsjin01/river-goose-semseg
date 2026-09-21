@@ -11,11 +11,22 @@
 PyTorch CUDA runtime을 지원해야 하며, CUDA 확장을 빌드하려면 호환되는 `nvcc`가
 필요하다.
 
+검증 버전을 그대로 구성하려면 저장소 루트에서 다음을 실행한다.
+
+```bash
+conda env create -f environment.yml
+conda activate river-semseg
+```
+
+가상환경을 직접 구성할 때는 `requirements-validated.txt`를 사용할 수 있다.
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+  -r requirements-validated.txt
+python -m pip install -e . --no-deps
 
 cd goose_semseg/models/ops/csrc
 python setup.py build install

@@ -1,0 +1,13 @@
+name: river-semseg
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - setuptools=80.9.0
+  - wheel=0.45.1
+  - cmake
+  - ninja
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - -r requirements-validated.txt

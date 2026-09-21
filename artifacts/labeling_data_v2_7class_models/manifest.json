@@ -1,0 +1,53 @@
+{
+  "created_utc": "2026-09-21T07:52:44.593031+00:00",
+  "dataset": "Labeling_Data_v2",
+  "taxonomy": "merged_algae_7class",
+  "input_channels": 9,
+  "class_names": [
+    "river",
+    "land",
+    "bridge",
+    "other",
+    "nps",
+    "turbid",
+    "algae_including_nps_algae"
+  ],
+  "models": [
+    {
+      "filename": "labeling_v2_7class_teacher_dinov3_vitl16_mask2former_best_val_miou_0.6207.pt",
+      "role": "teacher",
+      "architecture": "dinov3_vitl16_mask2former",
+      "epoch": 75,
+      "best_validation_miou_gt_supported": 0.6207295656204224,
+      "bytes": 4085387254,
+      "sha256": "8c32b5d132ea78794e26e6ccc3f1f226ba7a01d3ec27e7e87d7f1730e1a450b4",
+      "source_path": "outputs/labeling_merged_algae_7class_v3_gpu1/merged_algae7_gpu1_overlap_seed42/best_epoch_075_miou_0.6207.pt",
+      "storage": "hardlink_to_source_checkpoint",
+      "test_miou_gt_supported": 0.5905894637107849,
+      "test_tta": false
+    },
+    {
+      "filename": "labeling_v2_7class_student_segformer_b1_kd_best_val_miou_0.4814.pt",
+      "role": "student",
+      "architecture": "segformer_b1_kd",
+      "epoch": 30,
+      "best_validation_miou_gt_supported": 0.4813600480556488,
+      "bytes": 54801604,
+      "sha256": "e13806b77708650c8b106826bf4020d18d7a9c9a24d981dfd73ca525da8eb9f6",
+      "source_path": "outputs/labeling_merged_algae_7class_kd/b1/best.pt",
+      "storage": "hardlink_to_source_checkpoint"
+    },
+    {
+      "filename": "labeling_v2_7class_student_segformer_b0_kd_best_val_miou_0.4576.pt",
+      "role": "student",
+      "architecture": "segformer_b0_kd",
+      "epoch": 45,
+      "best_validation_miou_gt_supported": 0.4576129615306854,
+      "bytes": 14949060,
+      "sha256": "599a251d7df776bf10b8003f251f527fc780decb7f729c1a15b3be6cfa5da5bb",
+      "source_path": "outputs/labeling_merged_algae_7class_kd/b0/best.pt",
+      "storage": "hardlink_to_source_checkpoint"
+    }
+  ],
+  "note": "These are the completed fresh-teacher/KD experiment artifacts. The later multi-river-initialized teacher fine-tune is still a separate run."
+}
